@@ -30,7 +30,7 @@ type (
 	D = layout.Dimensions
 )
 
-const windowTitle = "마비노기 연타 매크로 v11"
+const windowTitle = "마비노기 키 다운 - v11.0.0"
 
 // 색상 팔레트 (다크 럭셔리 · 웜 블랙 + 골드)
 var (
@@ -858,7 +858,7 @@ func toggleTitleArea(gtx C, th *material.Theme, area *widget.Clickable, active b
 				}),
 				layout.Rigid(layout.Spacer{Height: unit.Dp(12)}.Layout),
 				layout.Rigid(func(gtx C) D {
-					l := material.Label(th, unit.Sp(17), "마비노기 연타 매크로")
+					l := material.Label(th, unit.Sp(17), "마비노기 키 다운")
 					l.Color = colText
 					l.Font.Weight = 600
 					l.Alignment = text.Middle
