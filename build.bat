@@ -1,20 +1,21 @@
 @echo off
+chcp 65001 >nul
 echo ==============================================
-echo Building Mabinogi Macro (GUI Mode)...
-echo Flag '-ldflags="-H windowsgui"' is applied
-echo to prevent the CMD window from showing up.
+echo 마비노기 키 다운 빌드 중... (GUI 모드)
+echo '-ldflags="-H windowsgui"' 플래그를 적용해
+echo CMD 창이 뜨지 않도록 합니다.
 echo ==============================================
 
-set OUTPUT_NAME=mabinogi_macro_v12.exe
+set OUTPUT_NAME=마비노기 키 다운 - v12.0.0.exe
 if not "%~1"=="" set OUTPUT_NAME=%~1
 
-go build -ldflags="-H windowsgui" -o %OUTPUT_NAME%
+go build -ldflags="-H windowsgui" -o "%OUTPUT_NAME%"
 
 if %errorlevel% neq 0 (
-    echo [ERROR] Build failed!
+    echo [오류] 빌드 실패!
     pause
     exit /b %errorlevel%
 )
 
-echo [SUCCESS] Build completed: %OUTPUT_NAME%
+echo [성공] 빌드 완료: %OUTPUT_NAME%
 pause
