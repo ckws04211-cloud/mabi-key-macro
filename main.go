@@ -30,7 +30,7 @@ type (
 	D = layout.Dimensions
 )
 
-const windowTitle = "마비노기 키 다운 - v11.0.0"
+const windowTitle = "마비노기 키 다운 - v12.0.0"
 
 // 색상 팔레트 (다크 럭셔리 · 웜 블랙 + 골드)
 var (
@@ -305,8 +305,9 @@ func loop(w *app.Window) error {
 		SaveConfig()
 	}
 
-	// 토글 펄스 애니메이션: on/off가 바뀔 때 상태 문구가 살짝 커졌다 작아지며 색이 전환된다.
-	const toggleAnimDur = 260 * time.Millisecond
+	// 토글 펄스 애니메이션: on/off가 바뀔 때 상태 문구가 살짝 커졌다 작아지며 색이 전환되고,
+	// 로고도 같은 진행률을 타고 그려지거나(on) 지워지는(off) 애니메이션을 재생한다.
+	const toggleAnimDur = 480 * time.Millisecond
 	toggleAnimActive := false
 	var toggleAnimStart time.Time
 	toggleAnimT := float32(1) // 1 = 애니메이션 없이 정착된 상태(올바른 색만 표시)
@@ -843,18 +844,19 @@ func toggleTitleArea(gtx C, th *material.Theme, area *widget.Clickable, active b
 		// 확대(pulse) 시 이 패딩 안에서만 커지도록 해 가장자리가 잘리지 않게 한다.
 		pad := unit.Dp(14)
 
+		// 로고 애니메이션 진행률(0~1): "완성된(on) 상태로부터의 거리"를 의미한다.
+		// on으로 켤 때는 animT(0→1)를 그대로 쓰고, off로 끌 때는 이를 뒤집어(1→0)
+		// 그리기 진행을 거꾸로 재생해 지워지는 것처럼 보이게 한다.
+		logoD := animT
+		if !active {
+			logoD = 1 - animT
+		}
+
 		macro := op.Record(gtx.Ops)
 		dims := layout.UniformInset(pad).Layout(gtx, func(gtx C) D {
 			return layout.Flex{Axis: layout.Vertical, Alignment: layout.Middle}.Layout(gtx,
 				layout.Rigid(func(gtx C) D {
-					op := float32(1)
-					if !active {
-						op = 0.4
-					}
-					st := paint.PushOpacity(gtx.Ops, op)
-					d := logoMark(gtx, unit.Dp(92), logoOp, haveLogo)
-					st.Pop()
-					return d
+					return logoMarkAnim(gtx, unit.Dp(92), logoOp, haveLogo, logoD)
 				}),
 				layout.Rigid(layout.Spacer{Height: unit.Dp(12)}.Layout),
 				layout.Rigid(func(gtx C) D {
@@ -989,16 +991,77 @@ func checklistRow(gtx C, th *material.Theme, ok bool, txt string) D {
 
 // logoMark: 골드 원형 배지 위에 마비노기 팬사이트 키트의 공식 심볼(logo.png)을
 // 원본 그대로(색 변형 없이) 얹는다. 이미지 디코딩에 실패하면 골드 배지만 그린다.
-// logoMark: 마비노기 심볼을 배경 없이 골드 라인 그대로 그린다(리컬러링은
-// decodeLogoImage에서 이미 적용됨).
-func logoMark(gtx C, dp unit.Dp, img paint.ImageOp, haveLogo bool) D {
+// logoDimAlpha: 매크로가 꺼져 있을 때(정착 상태) 로고를 아주 흐리게 깔아두는 투명도.
+const logoDimAlpha = 0.16
+
+// logoMarkAnim: 로고를 "완성된(on) 상태로부터의 거리" d(0=완전히 꺼진 정착 상태,
+// 1=완전히 켜진 정착 상태)에 따라 그린다. 항상 맨 뒤(z-index 가장 아래)에 아주
+// 흐린(logoDimAlpha) 원본 이미지를 깔아두고, 그 위에 중심에서부터 원(iris) 모양
+// 으로 커지는 마스크로 같은 원본 이미지를 온전한 밝기로 겹쳐 그린다 — 벡터로
+// 다시 그리는 게 아니라 항상 같은 원본 픽셀을 마스킹만 하는 것이므로, 어느
+// 시점에 봐도 최종 완성본과 완벽히 동일한 선이다. 드러난 경계에는 옅은 골드
+// 링을 얹어 "그려지는" 느낌을 더한다.
+//
+// off→on(켜기)에는 d를 0→1로, on→off(끄기)에는 반대로 1→0으로 재생해 같은 로직으로
+// "나타남"과 "사라짐"을 모두 표현한다.
+func logoMarkAnim(gtx C, dp unit.Dp, img paint.ImageOp, haveLogo bool, d float32) D {
 	sz := gtx.Dp(dp)
 	if !haveLogo {
 		return D{Size: image.Pt(sz, sz)}
 	}
-	sub := gtx
-	sub.Constraints = layout.Exact(image.Pt(sz, sz))
-	return widget.Image{Src: img, Fit: widget.Contain, Position: layout.Center}.Layout(sub)
+	if d < 0 {
+		d = 0
+	} else if d > 1 {
+		d = 1
+	}
+
+	drawFull := func() {
+		sub := gtx
+		sub.Constraints = layout.Exact(image.Pt(sz, sz))
+		widget.Image{Src: img, Fit: widget.Contain, Position: layout.Center}.Layout(sub)
+	}
+
+	// 뒷배경: 항상 흐리게 깔아둔다(z-index 가장 아래).
+	st := paint.PushOpacity(gtx.Ops, logoDimAlpha)
+	drawFull()
+	st.Pop()
+
+	if d <= 0 {
+		return D{Size: image.Pt(sz, sz)}
+	}
+
+	center := f32.Pt(float32(sz)/2, float32(sz)/2)
+	maxRadius := float32(sz) * 0.72 // 모서리까지 넉넉히 덮는 반경
+	radius := maxRadius * d
+
+	circle := clip.Ellipse{
+		Min: image.Pt(int(center.X-radius), int(center.Y-radius)),
+		Max: image.Pt(int(center.X+radius), int(center.Y+radius)),
+	}
+
+	// 앞배경: 원 안쪽만 온전한 밝기로 겹쳐 그린다.
+	if radius > 0.5 {
+		st := circle.Push(gtx.Ops)
+		drawFull()
+		st.Pop()
+	}
+
+	// 드러나는 경계를 은은한 골드 링으로 강조한다(끝날 무렵엔 서서히 사라짐).
+	if d < 1 {
+		ringAlpha := float32(1)
+		if d > 0.8 {
+			ringAlpha = 1 - (d-0.8)/0.2
+		}
+		ringW := float32(gtx.Dp(unit.Dp(1.5)))
+		st := paint.PushOpacity(gtx.Ops, ringAlpha)
+		strokeOp := clip.Stroke{Path: circle.Path(gtx.Ops), Width: ringW}.Op().Push(gtx.Ops)
+		paint.ColorOp{Color: colPrimary}.Add(gtx.Ops)
+		paint.PaintOp{}.Add(gtx.Ops)
+		strokeOp.Pop()
+		st.Pop()
+	}
+
+	return D{Size: image.Pt(sz, sz)}
 }
 
 // ---------- 설정 페이지 ----------
@@ -1014,7 +1077,7 @@ func settingsPageContent(gtx C, th *material.Theme, macroActive bool, slots []*s
 		}),
 		layout.Rigid(layout.Spacer{Height: unit.Dp(6)}.Layout),
 		layout.Rigid(func(gtx C) D {
-			return simpleToggleRow(gtx, th, autoStartSwitch, autoStartPos, "윈도우 시작 시 자동 실행", "로그인하면 자동으로 백그라운드에서 실행돼요")
+			return simpleToggleRow(gtx, th, autoStartSwitch, autoStartPos, "윈도우 시작 시 자동 실행", "컴퓨터를 켜면 이 프로그램이 자동으로 실행돼요")
 		}),
 		layout.Rigid(layout.Spacer{Height: unit.Dp(6)}.Layout),
 		layout.Rigid(func(gtx C) D {
@@ -1217,7 +1280,7 @@ func hotkeyRow(gtx C, th *material.Theme, btn *widget.Clickable, name string, ac
 // 고정된 기능 설명만 표시해 혼동을 줄인다).
 func focusGuardRow(gtx C, th *material.Theme, sw *widget.Bool, pos float32, gameFocused bool) D {
 	return settingRow(gtx, th, "마비노기에서만 작동",
-		"켜두면 디스코드 등 다른 프로그램에서는 설정한 키가 매크로 없이 평소처럼 입력돼요",
+		"다른 프로그램에서는 설정한 키가 매크로 없이 평소처럼 입력돼요",
 		switchControl(th, sw, pos))
 }
 

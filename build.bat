@@ -5,7 +5,7 @@ echo Flag '-ldflags="-H windowsgui"' is applied
 echo to prevent the CMD window from showing up.
 echo ==============================================
 
-set OUTPUT_NAME=mabinogi_macro_v11.exe
+set OUTPUT_NAME=mabinogi_macro_v12.exe
 if not "%~1"=="" set OUTPUT_NAME=%~1
 
 go build -ldflags="-H windowsgui" -o %OUTPUT_NAME%
