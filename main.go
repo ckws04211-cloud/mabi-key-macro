@@ -31,7 +31,7 @@ type (
 	D = layout.Dimensions
 )
 
-const windowTitle = "마비노기 키 다운 - v13.0.0"
+const windowTitle = "마비노기 키 다운 - v" + appVersion
 
 // autoSaveDelay: 설정 입력이 멈춘 뒤 자동 저장하기까지 기다리는 시간.
 const autoSaveDelay = 600 * time.Millisecond
@@ -237,9 +237,19 @@ func loop(w *app.Window) error {
 		w.Invalidate()
 	}
 
+	// 새 버전 알림: 공개 GitHub 릴리즈를 주기적으로 확인한다(끌 수 있음).
+	var updateSwitch widget.Bool
+	updateSwitch.Value = AppConfig.GetUpdateCheck()
+	var updateBtn widget.Clickable
+	UpdateStateCallback = func() {
+		w.Invalidate()
+	}
+	StartUpdateChecker()
+
 	focusGuardAnim := newSwitchAnim(focusGuardSwitch.Value)
 	autoStartAnim := newSwitchAnim(autoStartSwitch.Value)
 	chatGuardAnim := newSwitchAnim(chatGuardSwitch.Value)
+	updateAnim := newSwitchAnim(updateSwitch.Value)
 
 	var startBtn, addBtn widget.Clickable
 	// 설정은 바뀌면 잠깐(autoSaveDelay) 뒤 자동 저장한다. 저장 직후엔 "저장됨 ✓"을 잠깐 보여준다.
@@ -448,11 +458,13 @@ func loop(w *app.Window) error {
 			}
 			return statusPageContent(gtx, th, &startBtn, macroActive, hasAnyPair,
 				acTrigVK != 0, acRunning.Load(), focusGuardSwitch.Value, IsGameFocused(), warn, logoOp, haveLogo, toggleAnimT, hotkeyName, frameNow,
-				AppConfig.GetChatGuard(), macroActive && AppConfig.GetChatGuard() && IsChatOpen(), &chatResetBtn)
+				AppConfig.GetChatGuard(), macroActive && AppConfig.GetChatGuard() && IsChatOpen(), &chatResetBtn,
+				AvailableUpdate(), &updateBtn)
 		default:
 			return settingsPageContent(gtx, th, macroActive, slots, &addBtn,
 				&acTrigBtn, &acClearBtn, &acDelay, &acHold, acTrigName, activeBind,
-				&focusGuardSwitch, &autoStartSwitch, &chatGuardSwitch, focusGuardAnim.pos, autoStartAnim.pos, chatGuardAnim.pos, IsGameFocused(),
+				&focusGuardSwitch, &autoStartSwitch, &chatGuardSwitch, &updateSwitch,
+				focusGuardAnim.pos, autoStartAnim.pos, chatGuardAnim.pos, updateAnim.pos, IsGameFocused(),
 				&hotkeyBtn, hotkeyName, settingsList, savedFlash)
 		}
 	}
@@ -534,6 +546,23 @@ func loop(w *app.Window) error {
 				ResetChatState()
 			}
 
+			if !animating && updateSwitch.Update(gtx) {
+				AppConfig.SetUpdateCheck(updateSwitch.Value)
+				SaveConfig()
+				if updateSwitch.Value {
+					TriggerUpdateCheck() // 켜자마자 한 번 확인
+				} else {
+					ClearUpdateNotice()
+				}
+			}
+
+			// 새 버전 알림 줄을 클릭하면 릴리즈 페이지를 연다.
+			if updateBtn.Clicked(gtx) {
+				if u := AvailableUpdate(); u != nil {
+					OpenReleasePage(u.URL)
+				}
+			}
+
 			if !animating && autoStartSwitch.Update(gtx) {
 				if err := SetAutoStart(autoStartSwitch.Value); err != nil {
 					autoStartSwitch.Value = !autoStartSwitch.Value // 실패 시 되돌림
@@ -548,6 +577,9 @@ func loop(w *app.Window) error {
 				w.Invalidate()
 			}
 			if chatGuardAnim.tick(&chatGuardSwitch, e.Now) {
+				w.Invalidate()
+			}
+			if updateAnim.tick(&updateSwitch, e.Now) {
 				w.Invalidate()
 			}
 
@@ -866,7 +898,7 @@ func drawXIcon(gtx C, col color.NRGBA) D {
 
 // statusPageContent: 로고 + (클릭하면 on/off 되는) 상태 문구 + 체크리스트.
 // 별도 큰 버튼 없이 상태 문구 자체가 토글 버튼이다(펄스+색 전환 애니메이션 포함).
-func statusPageContent(gtx C, th *material.Theme, toggleArea *widget.Clickable, active, hasAnyPair, acConfigured, acRunning, focusGuardOn, gameFocused bool, warn string, logoOp paint.ImageOp, haveLogo bool, toggleAnimT float32, hotkeyName string, now time.Time, chatGuardOn, chatPaused bool, chatBtn *widget.Clickable) D {
+func statusPageContent(gtx C, th *material.Theme, toggleArea *widget.Clickable, active, hasAnyPair, acConfigured, acRunning, focusGuardOn, gameFocused bool, warn string, logoOp paint.ImageOp, haveLogo bool, toggleAnimT float32, hotkeyName string, now time.Time, chatGuardOn, chatPaused bool, chatBtn *widget.Clickable, upd *UpdateInfo, updBtn *widget.Clickable) D {
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Flexed(1, func(gtx C) D {
 			return statusCenterContent(gtx, th, toggleArea, active, hasAnyPair, acConfigured, acRunning, focusGuardOn, gameFocused, logoOp, haveLogo, toggleAnimT, now, chatGuardOn, chatPaused, chatBtn)
@@ -881,6 +913,20 @@ func statusPageContent(gtx C, th *material.Theme, toggleArea *widget.Clickable, 
 			return layout.Inset{Bottom: unit.Dp(6)}.Layout(gtx, func(gtx C) D {
 				gtx.Constraints.Min.X = gtx.Constraints.Max.X
 				return l.Layout(gtx)
+			})
+		}),
+		layout.Rigid(func(gtx C) D {
+			if upd == nil {
+				return D{}
+			}
+			// 새 버전이 있으면 한 줄로 알리고, 클릭하면 릴리즈 페이지를 연다.
+			return updBtn.Layout(gtx, func(gtx C) D {
+				l := material.Label(th, unit.Sp(11), "새 버전 v"+upd.Version+" 이 나왔어요 · 클릭해서 보기")
+				l.Color = colPrimary
+				l.Font.Weight = 600
+				l.Alignment = text.Middle
+				gtx.Constraints.Min.X = gtx.Constraints.Max.X
+				return layout.Inset{Top: unit.Dp(2), Bottom: unit.Dp(6)}.Layout(gtx, l.Layout)
 			})
 		}),
 		layout.Rigid(func(gtx C) D {
@@ -1200,7 +1246,7 @@ func logoMarkAnim(gtx C, dp unit.Dp, img paint.ImageOp, haveLogo bool, d float32
 
 func settingsPageContent(gtx C, th *material.Theme, macroActive bool, slots []*slotState, addBtn *widget.Clickable,
 	acTrigBtn, acClearBtn *widget.Clickable, acDelay, acHold *widget.Editor, acTrigName string, ab bindRef,
-	focusGuardSwitch, autoStartSwitch, chatGuardSwitch *widget.Bool, focusGuardPos, autoStartPos, chatGuardPos float32, gameFocused bool,
+	focusGuardSwitch, autoStartSwitch, chatGuardSwitch, updateSwitch *widget.Bool, focusGuardPos, autoStartPos, chatGuardPos, updatePos float32, gameFocused bool,
 	hotkeyBtn *widget.Clickable, hotkeyName string, list *widget.List, saved bool) D {
 
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
@@ -1214,6 +1260,10 @@ func settingsPageContent(gtx C, th *material.Theme, macroActive bool, slots []*s
 		layout.Rigid(layout.Spacer{Height: unit.Dp(6)}.Layout),
 		layout.Rigid(func(gtx C) D {
 			return simpleToggleRow(gtx, th, autoStartSwitch, autoStartPos, "윈도우 시작 시 자동 실행", "컴퓨터를 켜면 이 프로그램이 자동으로 실행돼요")
+		}),
+		layout.Rigid(layout.Spacer{Height: unit.Dp(6)}.Layout),
+		layout.Rigid(func(gtx C) D {
+			return simpleToggleRow(gtx, th, updateSwitch, updatePos, "새 버전 알림", "새 버전이 나오면 상태 화면에 알려줘요 (자동 설치는 하지 않아요)")
 		}),
 		layout.Rigid(layout.Spacer{Height: unit.Dp(6)}.Layout),
 		layout.Rigid(func(gtx C) D {

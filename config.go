@@ -39,14 +39,15 @@ type AutoClickerConfig struct {
 const DefaultToggleHotkeyVK = 0x7B // VK_F12
 
 type Config struct {
-	Slots             []MacroSlot       `json:"slots"`
-	AutoClicker       AutoClickerConfig `json:"auto_clicker"`
-	FocusGuardEnabled bool              `json:"focus_guard_enabled"`
-	ChatGuardEnabled  bool              `json:"chat_guard_enabled"`
-	ToggleHotkeyVK    uint32            `json:"toggle_hotkey_vk"`
-	ToggleHotkeyName  string            `json:"toggle_hotkey_name"`
-	IsActive          bool              `json:"-"` // UI 동작 여부는 저장하지 않음
-	mu                sync.RWMutex
+	Slots              []MacroSlot       `json:"slots"`
+	AutoClicker        AutoClickerConfig `json:"auto_clicker"`
+	FocusGuardEnabled  bool              `json:"focus_guard_enabled"`
+	ChatGuardEnabled   bool              `json:"chat_guard_enabled"`
+	UpdateCheckEnabled bool              `json:"update_check_enabled"`
+	ToggleHotkeyVK     uint32            `json:"toggle_hotkey_vk"`
+	ToggleHotkeyName   string            `json:"toggle_hotkey_name"`
+	IsActive           bool              `json:"-"` // UI 동작 여부는 저장하지 않음
+	mu                 sync.RWMutex
 }
 
 var AppConfig *Config
@@ -104,11 +105,12 @@ func defaultSlots(n int) []MacroSlot {
 
 func LoadConfig() {
 	AppConfig = &Config{
-		Slots:             defaultSlots(DefaultSlotCount),
-		FocusGuardEnabled: true, // 기본값: 마비노기 포커스 시에만 작동
-		ChatGuardEnabled:  true, // 기본값: 채팅 중(Enter 감지)에는 트리거 일시정지
-		ToggleHotkeyVK:    DefaultToggleHotkeyVK,
-		ToggleHotkeyName:  "F12",
+		Slots:              defaultSlots(DefaultSlotCount),
+		FocusGuardEnabled:  true, // 기본값: 마비노기 포커스 시에만 작동
+		ChatGuardEnabled:   true, // 기본값: 채팅 중(Enter 감지)에는 트리거 일시정지
+		UpdateCheckEnabled: true, // 기본값: 시작 시 새 버전 확인
+		ToggleHotkeyVK:     DefaultToggleHotkeyVK,
+		ToggleHotkeyName:   "F12",
 	}
 	AppConfig.AutoClicker.DelayMs = 100
 	AppConfig.AutoClicker.DownMs = DefaultDownMs
@@ -151,8 +153,9 @@ func LoadConfig() {
 			// focus_guard_enabled는 구버전 config.json에 없을 수 있으므로,
 			// 키가 아예 없을 때만 기본값(true)을 유지하고 명시된 값이 있으면 그대로 따른다.
 			var probe struct {
-				FocusGuardEnabled *bool `json:"focus_guard_enabled"`
-				ChatGuardEnabled  *bool `json:"chat_guard_enabled"`
+				FocusGuardEnabled  *bool `json:"focus_guard_enabled"`
+				ChatGuardEnabled   *bool `json:"chat_guard_enabled"`
+				UpdateCheckEnabled *bool `json:"update_check_enabled"`
 			}
 			if json.Unmarshal(data, &probe) == nil {
 				if probe.FocusGuardEnabled != nil {
@@ -160,6 +163,9 @@ func LoadConfig() {
 				}
 				if probe.ChatGuardEnabled != nil {
 					AppConfig.ChatGuardEnabled = *probe.ChatGuardEnabled
+				}
+				if probe.UpdateCheckEnabled != nil {
+					AppConfig.UpdateCheckEnabled = *probe.UpdateCheckEnabled
 				}
 			}
 
@@ -317,6 +323,19 @@ func (c *Config) SetChatGuard(enabled bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.ChatGuardEnabled = enabled
+}
+
+// SetUpdateCheck: 시작 시 새 버전 확인(알림)을 켜고 끈다.
+func (c *Config) SetUpdateCheck(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.UpdateCheckEnabled = enabled
+}
+
+func (c *Config) GetUpdateCheck() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.UpdateCheckEnabled
 }
 
 func (c *Config) GetChatGuard() bool {
