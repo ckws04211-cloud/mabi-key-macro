@@ -22,7 +22,7 @@ import (
 // 조용히 넘기고, 설정에서 끌 수 있다.
 
 const (
-	appVersion = "13.0.0" // 릴리즈 태그(v13.0.0)와 같은 형식의 숫자 버전
+	appVersion = "14.0.0" // 릴리즈 태그(v14.0.0)와 같은 형식의 숫자 버전
 
 	updateRepoURL   = "https://github.com/ckws04211-cloud/mabi-key-macro/"
 	updateLatestAPI = "https://api.github.com/repos/ckws04211-cloud/mabi-key-macro/releases/latest"

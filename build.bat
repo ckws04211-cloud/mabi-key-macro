@@ -6,7 +6,7 @@ echo '-ldflags="-H windowsgui"' 플래그를 적용해
 echo CMD 창이 뜨지 않도록 합니다.
 echo ==============================================
 
-set OUTPUT_NAME=마비노기 키 다운 - v13.0.0.exe
+set OUTPUT_NAME=마비노기 키 다운 - v14.0.0.exe
 if not "%~1"=="" set OUTPUT_NAME=%~1
 
 go build -ldflags="-H windowsgui" -o "%OUTPUT_NAME%"
