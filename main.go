@@ -401,6 +401,22 @@ func loop(w *app.Window) error {
 		}
 		hasAny := false
 		conflict := false
+		// 같은 트리거(키 + 조합키)를 두 슬롯에 넣으면 주기가 짧은 쪽만 조용히 적용되므로
+		// 시작 전에 알려준다. R과 Shift+R은 서로 다른 트리거라 겹침이 아니다.
+		dupA, dupB := 0, 0
+		seen := map[trigKey]int{}
+		for i, s := range slots {
+			if s.trigVK != 0 && s.targVK != 0 {
+				k := trigKey{s.trigVK, s.trigMods}
+				if first, ok := seen[k]; ok {
+					if dupA == 0 {
+						dupA, dupB = first+1, i+1
+					}
+				} else {
+					seen[k] = i
+				}
+			}
+		}
 		for _, s := range slots {
 			if s.trigVK != 0 && s.targVK != 0 {
 				hasAny = true
@@ -412,6 +428,8 @@ func loop(w *app.Window) error {
 		}
 		if !hasAny {
 			warn = "누르는 키 / 발동 키를 최소 1쌍 설정하세요 (설정 탭)."
+		} else if dupA != 0 {
+			warn = fmt.Sprintf("슬롯 %d과 슬롯 %d의 누르는 키가 같아요. 한 키는 한 슬롯에만 지정하세요 (설정 탭).", dupA, dupB)
 		} else if conflict {
 			warn = "오토클릭 트리거와 같은 키가 슬롯 트리거에 있어요 (오토클릭 우선)."
 		} else {
