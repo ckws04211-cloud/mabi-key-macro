@@ -251,6 +251,7 @@ const (
 var (
 	physKeys      atomic.Uint32 // 지금 실제로 눌려 있는 수정키(pk* 비트)
 	bindPendingVK atomic.Uint32 // 바인딩 중 눌린 채인 수정키 — 단독 수정키 바인딩 판정용
+	bindEscHeld   atomic.Bool   // Esc로 바인딩을 취소한 뒤 그 Esc가 아직 눌려 있는 동안
 
 	// 조합 트리거 발동 중에는 물리 수정키를 게임에 안 보이게 "뗀 것처럼" 만든다
 	// (Shift+R → '-'가 Shift+'-'로 들어가지 않도록). 워커가 여럿일 수 있어 참조 카운트.
@@ -620,6 +621,23 @@ func StartBinding() (<-chan BindingResult, <-chan struct{}) {
 	return BindingChan, BindingCancel
 }
 
+// CancelBinding: 진행 중인 키 바인딩을 아무 키도 지정하지 않고 취소한다(Esc).
+// 바인딩 중이었으면 true.
+func CancelBinding() bool {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	if !BindingMode {
+		return false
+	}
+	BindingMode = false
+	bindPendingVK.Store(0)
+	if BindingCancel != nil {
+		close(BindingCancel) // 대기 중인 UI 고루틴이 "취소" 결과를 받는다
+		BindingCancel = nil
+	}
+	return true
+}
+
 func TryBindKey(vk uint32, name string, mods uint32) bool {
 	stateMu.Lock()
 	defer stateMu.Unlock()
@@ -703,11 +721,23 @@ func keyboardHookImpl(nCode int, wParam uintptr, lParam uintptr) uintptr {
 		gameOk := !AppConfig.GetFocusGuard() || IsGameFocused()
 
 		if wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN {
+			// 바인딩을 Esc로 취소한 직후 Esc를 계속 누르고 있어서 생기는 반복 입력은 삼킨다
+			// (게임에 Esc가 흘러가 창이 닫히는 일을 막는다).
+			if kbd.VkCode == VK_ESCAPE && bindEscHeld.Load() {
+				return 1
+			}
 			stateMu.Lock()
 			isBinding := BindingMode
 			stateMu.Unlock()
 
 			if isBinding {
+				// Esc는 "취소" 키다. 키로 지정되지 않고 바인딩만 끝난다.
+				if kbd.VkCode == VK_ESCAPE {
+					if CancelBinding() {
+						bindEscHeld.Store(true)
+					}
+					return 1
+				}
 				// 수정키는 바로 바인딩하지 않고 기다린다: 뒤이어 다른 키가 눌리면 "조합"이고,
 				// 그냥 떼면 수정키 단독 바인딩이다(아래 keyup 처리).
 				if modClassOf(kbd.VkCode) != 0 {
@@ -743,6 +773,10 @@ func keyboardHookImpl(nCode int, wParam uintptr, lParam uintptr) uintptr {
 				}
 			}
 		} else if wParam == WM_KEYUP || wParam == WM_SYSKEYUP {
+			// Esc로 바인딩을 취소했다면 그 Esc의 키 업도 게임에 보내지 않는다.
+			if kbd.VkCode == VK_ESCAPE && bindEscHeld.Swap(false) {
+				return 1
+			}
 			stateMu.Lock()
 			isBinding := BindingMode
 			stateMu.Unlock()

@@ -1688,7 +1688,7 @@ func keyPicker(gtx C, th *material.Theme, placeholder string, btn *widget.Clicka
 	switch {
 	case active:
 		// 입력 대기 = 앰버 솔리드 (주의 환기, 잠깐 상태)
-		b := material.Button(th, btn, "키 입력…")
+		b := material.Button(th, btn, "키 입력… (Esc 취소)")
 		b.Background, b.Color = colAmber, colOnGold
 		b.CornerRadius = unit.Dp(8)
 		b.TextSize = unit.Sp(13)
