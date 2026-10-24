@@ -1,12 +1,13 @@
 package main
 
 import (
+	"fmt"
 	"image"
 	"image/color"
-	"log"
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -30,7 +31,13 @@ type (
 	D = layout.Dimensions
 )
 
-const windowTitle = "마비노기 키 다운 - v12.0.0"
+const windowTitle = "마비노기 키 다운 - v13.0.0"
+
+// autoSaveDelay: 설정 입력이 멈춘 뒤 자동 저장하기까지 기다리는 시간.
+const autoSaveDelay = 600 * time.Millisecond
+
+// scanLineFrameInterval:매크로 작동 중 스캔 라인 애니메이션의 프레임 간격(≈30fps).
+const scanLineFrameInterval = 33 * time.Millisecond
 
 // 색상 팔레트 (다크 럭셔리 · 웜 블랙 + 골드)
 var (
@@ -85,14 +92,17 @@ type bindRef struct {
 
 type bindResult struct {
 	vk        uint32
+	mods      uint32
 	name      string
 	cancelled bool
+	seq       int // 어느 바인딩 요청에서 온 결과인지(낡은 취소 무시용)
 }
 
 type slotState struct {
 	trigBtn, targBtn, clearBtn, delBtn widget.Clickable
 	delay, hold                        widget.Editor
 	trigVK, targVK                     uint32
+	trigMods                           uint32
 	trigName, targName                 string
 }
 
@@ -106,28 +116,45 @@ func newSlotState(delayMs, downMs int) *slotState {
 }
 
 func main() {
+	// 이미 실행 중이면 그 창을 앞으로 가져오고 종료한다(훅이 두 벌 설치되는 것을 막는다).
+	if !ensureSingleInstance() {
+		activateExistingInstance()
+		return
+	}
+
 	LoadConfig()
+	initCrashLog()      // 설정 폴더가 정해진 뒤, 다른 어떤 고루틴보다 먼저 열어 둔다
+	MaintainAutoStart() // 예전 Run 키 항목 이전, 버전 교체로 사라진 경로 재등록
 
 	if err := StartHookSystem(); err != nil {
-		log.Println("hook install failed:", err)
+		logEvent("훅 설치 실패", err)
 		os.Exit(1)
 	}
 
-	go applyWindowIcon(windowTitle)
+	safeGo("창 아이콘 적용", func() { applyWindowIcon(windowTitle) })
 	StartFocusWatcher()
 
 	go func() {
+		// UI 루프에서 패닉이 나면 기록하고 종료한다(창이 멈춘 채 훅만 남아 키를 삼키는 것보다 낫다).
+		defer func() {
+			if r := recover(); r != nil {
+				logCrash("UI 루프", r)
+				StopHookSystem()
+				os.Exit(1)
+			}
+		}()
 		w := new(app.Window)
 		w.Option(
 			app.Title(windowTitle),
-			app.Size(unit.Dp(360), unit.Dp(460)),
-			app.MinSize(unit.Dp(360), unit.Dp(460)),
+			app.Size(unit.Dp(360), unit.Dp(560)),
+			app.MinSize(unit.Dp(360), unit.Dp(560)),
 			app.Decorated(false), // OS 타이틀바를 끄고 자체 타이틀바(프레임리스)를 그린다
 		)
 		err := loop(w)
 		StopHookSystem()
 		if err != nil {
-			log.Fatal(err)
+			logEvent("창 루프 오류 종료", err)
+			os.Exit(1)
 		}
 		os.Exit(0)
 	}()
@@ -162,7 +189,7 @@ func loop(w *app.Window) error {
 	slots := make([]*slotState, len(data))
 	for i := range data {
 		s := newSlotState(data[i].DelayMs, data[i].DownMs)
-		s.trigVK, s.trigName = data[i].TriggerVK, data[i].TriggerName
+		s.trigVK, s.trigName, s.trigMods = data[i].TriggerVK, data[i].TriggerName, data[i].TriggerMods
 		s.targVK, s.targName = data[i].TargetVK, data[i].TargetName
 		slots[i] = s
 	}
@@ -201,12 +228,25 @@ func loop(w *app.Window) error {
 	var autoStartSwitch widget.Bool
 	autoStartSwitch.Value = IsAutoStartEnabled()
 
+	// 채팅 중 일시정지: Enter 입력으로 채팅을 추정하는 방식이라 오감지 가능성이 있어
+	// 끌 수 있게 하고, 상태 페이지에서 클릭해 초기화할 수 있게 한다.
+	var chatGuardSwitch widget.Bool
+	chatGuardSwitch.Value = AppConfig.GetChatGuard()
+	var chatResetBtn widget.Clickable
+	ChatStateCallback = func(bool) {
+		w.Invalidate()
+	}
+
 	focusGuardAnim := newSwitchAnim(focusGuardSwitch.Value)
 	autoStartAnim := newSwitchAnim(autoStartSwitch.Value)
+	chatGuardAnim := newSwitchAnim(chatGuardSwitch.Value)
 
-	var startBtn, addBtn, saveBtn widget.Clickable
+	var startBtn, addBtn widget.Clickable
+	// 설정은 바뀌면 잠깐(autoSaveDelay) 뒤 자동 저장한다. 저장 직후엔 "저장됨 ✓"을 잠깐 보여준다.
 	var savedFlashUntil time.Time
 	savedFlash := false
+	var saveDueAt time.Time
+	var lastSig string
 	// 설정 페이지 스크롤 목록의 상태. 프레임마다 새로 만들면 스크롤 위치가 매번
 	// 리셋되어 스크롤이 안 되는 것처럼 보이므로, 반드시 loop() 수명 동안 유지한다.
 	settingsList := &widget.List{}
@@ -246,15 +286,22 @@ func loop(w *app.Window) error {
 	var activeBind bindRef
 	resultCh := make(chan bindResult, 8)
 
+	// 바인딩 요청 번호. 바인딩 도중 다른 칸을 눌러 새로 시작하면 이전 요청의 "취소"
+	// 결과가 새 요청 시작 뒤에 도착하는데, 번호를 비교하지 않으면 그 취소가 새 바인딩의
+	// 상태(activeBind)까지 지워서 이후 눌린 키가 어디에도 저장되지 않고 사라진다.
+	bindSeq := 0
+
 	startBind := func(ref bindRef) {
+		bindSeq++
+		seq := bindSeq
 		activeBind = ref
 		bChan, cancel := StartBinding()
 		go func() {
 			select {
 			case res := <-bChan:
-				resultCh <- bindResult{vk: res.VK, name: res.Name}
+				resultCh <- bindResult{vk: res.VK, mods: res.Mods, name: res.Name, seq: seq}
 			case <-cancel:
-				resultCh <- bindResult{cancelled: true}
+				resultCh <- bindResult{cancelled: true, seq: seq}
 			}
 			w.Invalidate()
 		}()
@@ -262,14 +309,19 @@ func loop(w *app.Window) error {
 
 	applyBind := func(r bindResult) {
 		if r.cancelled {
-			activeBind = bindRef{}
+			// 이미 더 새로운 바인딩이 시작됐다면(번호가 다르면) 낡은 취소는 무시한다.
+			if r.seq == bindSeq {
+				activeBind = bindRef{}
+			}
 			return
 		}
 		switch activeBind.kind {
 		case bindTrigger:
 			if activeBind.slot < len(slots) {
+				// 조합키(Shift+R 등)는 트리거에서만 지원한다.
 				slots[activeBind.slot].trigVK = r.vk
-				slots[activeBind.slot].trigName = r.name
+				slots[activeBind.slot].trigMods = r.mods
+				slots[activeBind.slot].trigName = ModPrefix(r.mods) + r.name
 			}
 		case bindTarget:
 			if activeBind.slot < len(slots) {
@@ -288,12 +340,23 @@ func loop(w *app.Window) error {
 		activeBind = bindRef{}
 	}
 
+	// settingsSig: 저장 대상 입력값(슬롯 + 오토클릭)을 한 문자열로 요약한다. 이 값이
+	// 마지막 저장 때와 달라졌을 때만 저장하면 되므로, 입력창 글자 하나하나를 추적할 필요가 없다.
+	settingsSig := func() string {
+		var b strings.Builder
+		for _, s := range slots {
+			fmt.Fprintf(&b, "%d/%d/%s|%d/%s|%s|%s;", s.trigVK, s.trigMods, s.trigName, s.targVK, s.targName, s.delay.Text(), s.hold.Text())
+		}
+		fmt.Fprintf(&b, "A%d/%s|%s|%s", acTrigVK, acTrigName, acDelay.Text(), acHold.Text())
+		return b.String()
+	}
+
 	// 현재 UI 슬롯 상태를 config에 반영하고 저장
 	commit := func() {
 		built := make([]MacroSlot, len(slots))
 		for i, s := range slots {
 			built[i] = MacroSlot{
-				TriggerVK: s.trigVK, TriggerName: s.trigName,
+				TriggerVK: s.trigVK, TriggerMods: s.trigMods, TriggerName: s.trigName,
 				TargetVK: s.targVK, TargetName: s.targName,
 				DelayMs: atoiDef(s.delay.Text(), 100),
 				DownMs:  atoiDef(s.hold.Text(), DefaultDownMs),
@@ -303,7 +366,10 @@ func loop(w *app.Window) error {
 		AppConfig.UpdateAutoClicker(acTrigVK, acTrigName,
 			atoiDef(acDelay.Text(), 100), atoiDef(acHold.Text(), DefaultDownMs))
 		SaveConfig()
+		lastSig = settingsSig() // 방금 저장한 내용 기준으로 맞춰 중복 저장을 막는다
+		saveDueAt = time.Time{}
 	}
+	lastSig = settingsSig() // 시작 시점의 값 = 이미 저장돼 있는 값
 
 	// 토글 펄스 애니메이션: on/off가 바뀔 때 상태 문구가 살짝 커졌다 작아지며 색이 전환되고,
 	// 로고도 같은 진행률을 타고 그려지거나(on) 지워지는(off) 애니메이션을 재생한다.
@@ -317,6 +383,7 @@ func loop(w *app.Window) error {
 		if macroActive {
 			AppConfig.SetActive(false)
 			StopAllWorkers()
+			ResetChatState()
 			macroActive = false
 			toggleAnimStart, toggleAnimT, toggleAnimActive = now, 0, true
 			w.Invalidate()
@@ -340,6 +407,7 @@ func loop(w *app.Window) error {
 		} else {
 			warn = ""
 			commit()
+			ResetChatState() // 켜는 시점엔 채팅이 닫혀 있다고 가정하고 시작
 			AppConfig.SetActive(true)
 			macroActive = true
 			toggleAnimStart, toggleAnimT, toggleAnimActive = now, 0, true
@@ -379,20 +447,31 @@ func loop(w *app.Window) error {
 				}
 			}
 			return statusPageContent(gtx, th, &startBtn, macroActive, hasAnyPair,
-				acTrigVK != 0, acRunning.Load(), focusGuardSwitch.Value, IsGameFocused(), warn, logoOp, haveLogo, toggleAnimT, hotkeyName, frameNow)
+				acTrigVK != 0, acRunning.Load(), focusGuardSwitch.Value, IsGameFocused(), warn, logoOp, haveLogo, toggleAnimT, hotkeyName, frameNow,
+				AppConfig.GetChatGuard(), macroActive && AppConfig.GetChatGuard() && IsChatOpen(), &chatResetBtn)
 		default:
 			return settingsPageContent(gtx, th, macroActive, slots, &addBtn,
 				&acTrigBtn, &acClearBtn, &acDelay, &acHold, acTrigName, activeBind,
-				&focusGuardSwitch, &autoStartSwitch, focusGuardAnim.pos, autoStartAnim.pos, IsGameFocused(),
-				&hotkeyBtn, hotkeyName, settingsList, &saveBtn, savedFlash)
+				&focusGuardSwitch, &autoStartSwitch, &chatGuardSwitch, focusGuardAnim.pos, autoStartAnim.pos, chatGuardAnim.pos, IsGameFocused(),
+				&hotkeyBtn, hotkeyName, settingsList, savedFlash)
 		}
 	}
 
 	var ops op.Ops
+	minimized := false // 창이 최소화돼 화면에 안 보이는 동안은 무한 애니메이션을 멈춘다
 	for {
 		switch e := w.Event().(type) {
 		case app.DestroyEvent:
+			if !saveDueAt.IsZero() {
+				commit() // 저장 대기 중이던 변경이 있으면 닫기 전에 반영한다
+			}
 			return e.Err
+		case app.ConfigEvent:
+			wasMin := minimized
+			minimized = e.Config.Mode == app.Minimized
+			if wasMin && !minimized {
+				w.Invalidate() // 복원되면 멈춰 있던 애니메이션 체인을 다시 시작
+			}
 		case app.FrameEvent:
 			frameNow = e.Now
 			gtx := app.NewContext(&ops, e)
@@ -442,6 +521,19 @@ func loop(w *app.Window) error {
 				SaveConfig()
 			}
 
+			if !animating && chatGuardSwitch.Update(gtx) {
+				AppConfig.SetChatGuard(chatGuardSwitch.Value)
+				SaveConfig()
+				if !chatGuardSwitch.Value {
+					ResetChatState() // 끄면 일시정지 상태도 즉시 해제
+				}
+			}
+
+			// 상태 페이지의 "채팅 중" 줄을 클릭하면 추정 상태를 초기화한다.
+			if chatResetBtn.Clicked(gtx) {
+				ResetChatState()
+			}
+
 			if !animating && autoStartSwitch.Update(gtx) {
 				if err := SetAutoStart(autoStartSwitch.Value); err != nil {
 					autoStartSwitch.Value = !autoStartSwitch.Value // 실패 시 되돌림
@@ -453,6 +545,9 @@ func loop(w *app.Window) error {
 				w.Invalidate()
 			}
 			if autoStartAnim.tick(&autoStartSwitch, e.Now) {
+				w.Invalidate()
+			}
+			if chatGuardAnim.tick(&chatGuardSwitch, e.Now) {
 				w.Invalidate()
 			}
 
@@ -467,7 +562,7 @@ func loop(w *app.Window) error {
 						startBind(bindRef{bindTarget, i})
 					}
 					if s.clearBtn.Clicked(gtx) {
-						s.trigVK, s.trigName = 0, ""
+						s.trigVK, s.trigMods, s.trigName = 0, 0, ""
 						s.targVK, s.targName = 0, ""
 						s.delay.SetText("100")
 						s.hold.SetText(strconv.Itoa(DefaultDownMs))
@@ -484,11 +579,6 @@ func loop(w *app.Window) error {
 				if addBtn.Clicked(gtx) && len(slots) < MaxSlots {
 					slots = append(slots, newSlotState(100, DefaultDownMs))
 					commit()
-				}
-				if saveBtn.Clicked(gtx) {
-					commit()
-					savedFlashUntil = e.Now.Add(1200 * time.Millisecond)
-					w.Invalidate()
 				}
 				if acTrigBtn.Clicked(gtx) {
 					startBind(bindRef{bindAuto, -1})
@@ -521,10 +611,32 @@ func loop(w *app.Window) error {
 				}
 			}
 
-			// 매크로 작동 중에는 상태 문구 아래 라인 스캔 애니메이션이 계속 흘러가야 하므로
-			// 상태 페이지가 보이는 동안 매 프레임 다시 그리도록 요청한다.
-			if macroActive && currentPage == pageStatus {
-				w.Invalidate()
+			// 매크로 작동 중에는 상태 문구 아래 라인 스캔 애니메이션이 계속 흘러가야 한다.
+			// 다만 화면에 보이지 않는 최소화 상태에서는 그릴 필요가 없으니 멈추고, 보일 때도
+			// 매 프레임(60fps)이 아니라 약 30fps로만 다시 그려 CPU/GPU 사용을 줄인다.
+			// (최소화에서 복원되면 ConfigEvent → 프레임이 다시 오면서 이 요청이 재개된다)
+			if macroActive && currentPage == pageStatus && !minimized {
+				gtx.Execute(op.InvalidateCmd{At: e.Now.Add(scanLineFrameInterval)})
+			}
+
+			// 자동 저장: 설정 페이지에서 값이 바뀌면 입력이 멈춘 뒤 autoSaveDelay 후에 저장한다
+			// (숫자를 한 글자씩 칠 때마다 디스크에 쓰지 않도록). 페이지를 떠나거나 매크로를
+			// 켜는 경우엔 기다리지 않고 바로 저장한다.
+			if currentPage == pageSettings && !macroActive {
+				if sig := settingsSig(); sig != lastSig {
+					lastSig = sig
+					saveDueAt = e.Now.Add(autoSaveDelay)
+				}
+				if !saveDueAt.IsZero() {
+					if !e.Now.Before(saveDueAt) {
+						commit()
+						savedFlashUntil = e.Now.Add(1200 * time.Millisecond)
+					} else {
+						gtx.Execute(op.InvalidateCmd{At: saveDueAt})
+					}
+				}
+			} else if !saveDueAt.IsZero() {
+				commit()
 			}
 
 			// "저장됨" 표시가 떠 있는 동안은 계속 다음 프레임을 요청해 시간이 지나면 저절로 사라지게 한다.
@@ -754,10 +866,10 @@ func drawXIcon(gtx C, col color.NRGBA) D {
 
 // statusPageContent: 로고 + (클릭하면 on/off 되는) 상태 문구 + 체크리스트.
 // 별도 큰 버튼 없이 상태 문구 자체가 토글 버튼이다(펄스+색 전환 애니메이션 포함).
-func statusPageContent(gtx C, th *material.Theme, toggleArea *widget.Clickable, active, hasAnyPair, acConfigured, acRunning, focusGuardOn, gameFocused bool, warn string, logoOp paint.ImageOp, haveLogo bool, toggleAnimT float32, hotkeyName string, now time.Time) D {
+func statusPageContent(gtx C, th *material.Theme, toggleArea *widget.Clickable, active, hasAnyPair, acConfigured, acRunning, focusGuardOn, gameFocused bool, warn string, logoOp paint.ImageOp, haveLogo bool, toggleAnimT float32, hotkeyName string, now time.Time, chatGuardOn, chatPaused bool, chatBtn *widget.Clickable) D {
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Flexed(1, func(gtx C) D {
-			return statusCenterContent(gtx, th, toggleArea, active, hasAnyPair, acConfigured, acRunning, focusGuardOn, gameFocused, logoOp, haveLogo, toggleAnimT, now)
+			return statusCenterContent(gtx, th, toggleArea, active, hasAnyPair, acConfigured, acRunning, focusGuardOn, gameFocused, logoOp, haveLogo, toggleAnimT, now, chatGuardOn, chatPaused, chatBtn)
 		}),
 		layout.Rigid(func(gtx C) D {
 			if warn == "" {
@@ -782,7 +894,7 @@ func statusPageContent(gtx C, th *material.Theme, toggleArea *widget.Clickable, 
 }
 
 // statusCenterContent: 로고·제목·체크리스트 등 상태 페이지의 중앙 콘텐츠.
-func statusCenterContent(gtx C, th *material.Theme, toggleArea *widget.Clickable, active, hasAnyPair, acConfigured, acRunning, focusGuardOn, gameFocused bool, logoOp paint.ImageOp, haveLogo bool, toggleAnimT float32, now time.Time) D {
+func statusCenterContent(gtx C, th *material.Theme, toggleArea *widget.Clickable, active, hasAnyPair, acConfigured, acRunning, focusGuardOn, gameFocused bool, logoOp paint.ImageOp, haveLogo bool, toggleAnimT float32, now time.Time, chatGuardOn, chatPaused bool, chatBtn *widget.Clickable) D {
 	return layout.Center.Layout(gtx, func(gtx C) D {
 		return layout.Flex{Axis: layout.Vertical, Alignment: layout.Middle}.Layout(gtx,
 			layout.Rigid(func(gtx C) D {
@@ -820,6 +932,21 @@ func statusCenterContent(gtx C, th *material.Theme, toggleArea *widget.Clickable
 					txt = "마비노기 포커스 중"
 				}
 				return checklistRow(gtx, th, focusGuardOn && gameFocused, txt)
+			}),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(6)}.Layout),
+			layout.Rigid(func(gtx C) D {
+				// 채팅 감지 상태는 항상 한 줄로 보여준다. 채팅 중으로 추정되면 주황색
+				// 안내로 바뀌고, 클릭하면 감지 상태를 초기화한다(오감지 대비).
+				switch {
+				case chatPaused:
+					return chatBtn.Layout(gtx, func(gtx C) D {
+						return checklistRowCol(gtx, th, colAmber, "채팅 중 · 매크로 일시정지 (클릭해 초기화)")
+					})
+				case chatGuardOn:
+					return checklistRow(gtx, th, true, "채팅 감지 켜짐")
+				default:
+					return checklistRow(gtx, th, false, "채팅 감지 꺼짐")
+				}
 			}),
 		)
 	})
@@ -973,6 +1100,11 @@ func checklistRow(gtx C, th *material.Theme, ok bool, txt string) D {
 	if ok {
 		col = colGreen
 	}
+	return checklistRowCol(gtx, th, col, txt)
+}
+
+// checklistRowCol: checklistRow와 같은 모양에 점 색을 직접 지정한다.
+func checklistRowCol(gtx C, th *material.Theme, col color.NRGBA, txt string) D {
 	return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
 		layout.Rigid(func(gtx C) D {
 			d := gtx.Dp(unit.Dp(6))
@@ -1068,12 +1200,16 @@ func logoMarkAnim(gtx C, dp unit.Dp, img paint.ImageOp, haveLogo bool, d float32
 
 func settingsPageContent(gtx C, th *material.Theme, macroActive bool, slots []*slotState, addBtn *widget.Clickable,
 	acTrigBtn, acClearBtn *widget.Clickable, acDelay, acHold *widget.Editor, acTrigName string, ab bindRef,
-	focusGuardSwitch, autoStartSwitch *widget.Bool, focusGuardPos, autoStartPos float32, gameFocused bool,
-	hotkeyBtn *widget.Clickable, hotkeyName string, list *widget.List, saveBtn *widget.Clickable, saved bool) D {
+	focusGuardSwitch, autoStartSwitch, chatGuardSwitch *widget.Bool, focusGuardPos, autoStartPos, chatGuardPos float32, gameFocused bool,
+	hotkeyBtn *widget.Clickable, hotkeyName string, list *widget.List, saved bool) D {
 
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(func(gtx C) D {
 			return focusGuardRow(gtx, th, focusGuardSwitch, focusGuardPos, gameFocused)
+		}),
+		layout.Rigid(layout.Spacer{Height: unit.Dp(6)}.Layout),
+		layout.Rigid(func(gtx C) D {
+			return simpleToggleRow(gtx, th, chatGuardSwitch, chatGuardPos, "채팅 중에는 일시정지", "Enter로 채팅을 열면 매크로 키가 그대로 입력돼요 (Esc·상태 화면 클릭으로 초기화)")
 		}),
 		layout.Rigid(layout.Spacer{Height: unit.Dp(6)}.Layout),
 		layout.Rigid(func(gtx C) D {
@@ -1104,20 +1240,23 @@ func settingsPageContent(gtx C, th *material.Theme, macroActive bool, slots []*s
 		}),
 		layout.Rigid(layout.Spacer{Height: unit.Dp(8)}.Layout),
 		layout.Rigid(func(gtx C) D {
-			return settingsSaveButton(gtx, th, saveBtn, saved)
+			return settingsSaveHint(gtx, th, saved)
 		}),
 	)
 }
 
-// settingsSaveButton: 슬롯/딜레이 등 현재 입력값을 config.json에 즉시 저장한다.
-// (매크로를 켜면 어차피 자동 저장되지만, 켜지 않고도 값을 남기고 싶을 때 쓴다)
-func settingsSaveButton(gtx C, th *material.Theme, btn *widget.Clickable, saved bool) D {
-	label := "설정 저장"
+// settingsSaveHint: 설정은 바뀔 때 자동 저장된다. 저장 버튼 자리에는 안내 문구를 두고,
+// 저장 직후 잠깐만 "저장됨 ✓"로 바꿔 저장됐음을 알려준다(줄 높이는 그대로).
+func settingsSaveHint(gtx C, th *material.Theme, saved bool) D {
+	txt, col := "변경 사항은 자동으로 저장돼요", colSub
 	if saved {
-		label = "저장됨 ✓"
+		txt, col = "저장됨 ✓", colPrimary
 	}
+	l := material.Label(th, unit.Sp(11), txt)
+	l.Color = col
+	l.Alignment = text.Middle
 	gtx.Constraints.Min.X = gtx.Constraints.Max.X
-	return outlineBtn(gtx, th, btn, label, colPrimary, colPrimary, unit.Sp(13), true, unit.Dp(10), unit.Dp(1), unit.Dp(10))
+	return layout.Inset{Top: unit.Dp(2), Bottom: unit.Dp(4)}.Layout(gtx, l.Layout)
 }
 
 func statusPill(gtx C, th *material.Theme, active bool) D {
@@ -1302,7 +1441,7 @@ func slotsPanel(gtx C, th *material.Theme, slots []*slotState, ab bindRef, locke
 				return l.Layout(gtx)
 			}),
 			layout.Rigid(func(gtx C) D {
-				l := material.Label(th, unit.Sp(10), "누르는 키를 누르고 있으면 발동 키가 반복 입력돼요")
+				l := material.Label(th, unit.Sp(10), "누르는 키를 누르고 있으면 발동 키가 반복 입력돼요 (Shift·Ctrl·Alt 조합 가능)")
 				l.Color = colSub
 				return layout.Inset{Top: unit.Dp(1), Bottom: unit.Dp(7)}.Layout(gtx, l.Layout)
 			}),

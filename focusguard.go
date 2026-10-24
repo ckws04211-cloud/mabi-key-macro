@@ -45,14 +45,23 @@ func StartFocusWatcher() {
 		first := true
 		var last bool
 		for {
-			cur := checkForegroundIsGame()
-			if first || cur != last {
-				gameFocused.Store(cur)
-				if FocusStateCallback != nil {
-					go FocusStateCallback(cur)
+			// 한 번의 점검에서 패닉이 나도 감시 루프 자체가 죽지 않게 점검 단위로 복구한다
+			// (감시가 멈추면 포커스 상태가 낡은 채로 남아 엉뚱한 창에서 매크로가 동작한다).
+			func() {
+				defer recoverPanic("포커스 감시")
+				watchInputDesktop() // UAC/잠금 화면 등 보안 데스크톱 전환 시 워커 정리
+				cur := checkForegroundIsGame()
+				if first || cur != last {
+					gameFocused.Store(cur)
+					if !cur {
+						ResetChatState() // 게임을 벗어나면 채팅 추정 상태도 초기화
+					}
+					if FocusStateCallback != nil {
+						go FocusStateCallback(cur)
+					}
+					last, first = cur, false
 				}
-				last, first = cur, false
-			}
+			}()
 			time.Sleep(200 * time.Millisecond)
 		}
 	}()

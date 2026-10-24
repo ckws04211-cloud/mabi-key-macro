@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
@@ -18,7 +17,10 @@ const (
 )
 
 type MacroSlot struct {
-	TriggerVK   uint32 `json:"trigger_vk"`
+	TriggerVK uint32 `json:"trigger_vk"`
+	// TriggerMods: 트리거에 함께 눌러야 하는 조합키(ModShift|ModCtrl|ModAlt). 0이면 단일 키.
+	// 구버전 config에는 없으므로 omitempty — 없으면 0(단일 키)으로 읽힌다.
+	TriggerMods uint32 `json:"trigger_mods,omitempty"`
 	TriggerName string `json:"trigger_name"`
 	TargetVK    uint32 `json:"target_vk"`
 	TargetName  string `json:"target_name"`
@@ -40,6 +42,7 @@ type Config struct {
 	Slots             []MacroSlot       `json:"slots"`
 	AutoClicker       AutoClickerConfig `json:"auto_clicker"`
 	FocusGuardEnabled bool              `json:"focus_guard_enabled"`
+	ChatGuardEnabled  bool              `json:"chat_guard_enabled"`
 	ToggleHotkeyVK    uint32            `json:"toggle_hotkey_vk"`
 	ToggleHotkeyName  string            `json:"toggle_hotkey_name"`
 	IsActive          bool              `json:"-"` // UI 동작 여부는 저장하지 않음
@@ -49,8 +52,14 @@ type Config struct {
 var AppConfig *Config
 var configFilePath string
 
+// trigKey: 트리거 식별자 = 키(VK) + 조합키 마스크. R과 Shift+R은 서로 다른 트리거다.
+type trigKey struct {
+	VK   uint32
+	Mods uint32
+}
+
 var (
-	ActiveTriggers   map[uint32]MacroSlot
+	ActiveTriggers   map[trigKey]MacroSlot
 	ActiveTriggersMu sync.RWMutex
 )
 
@@ -97,14 +106,14 @@ func LoadConfig() {
 	AppConfig = &Config{
 		Slots:             defaultSlots(DefaultSlotCount),
 		FocusGuardEnabled: true, // 기본값: 마비노기 포커스 시에만 작동
+		ChatGuardEnabled:  true, // 기본값: 채팅 중(Enter 감지)에는 트리거 일시정지
 		ToggleHotkeyVK:    DefaultToggleHotkeyVK,
 		ToggleHotkeyName:  "F12",
 	}
 	AppConfig.AutoClicker.DelayMs = 100
 	AppConfig.AutoClicker.DownMs = DefaultDownMs
 
-	data, err := ioutil.ReadFile(configFilePath)
-	if err == nil {
+	if data := readConfigFile(); data != nil {
 		var loaded Config
 		if err := json.Unmarshal(data, &loaded); err == nil {
 			// 저장된 슬롯 개수를 그대로 복원 (1..MaxSlots로 클램프)
@@ -116,6 +125,7 @@ func LoadConfig() {
 				slots := make([]MacroSlot, n)
 				for i := 0; i < n; i++ {
 					slots[i].TriggerVK = loaded.Slots[i].TriggerVK
+					slots[i].TriggerMods = loaded.Slots[i].TriggerMods
 					slots[i].TriggerName = loaded.Slots[i].TriggerName
 					slots[i].TargetVK = loaded.Slots[i].TargetVK
 					slots[i].TargetName = loaded.Slots[i].TargetName
@@ -142,9 +152,15 @@ func LoadConfig() {
 			// 키가 아예 없을 때만 기본값(true)을 유지하고 명시된 값이 있으면 그대로 따른다.
 			var probe struct {
 				FocusGuardEnabled *bool `json:"focus_guard_enabled"`
+				ChatGuardEnabled  *bool `json:"chat_guard_enabled"`
 			}
-			if json.Unmarshal(data, &probe) == nil && probe.FocusGuardEnabled != nil {
-				AppConfig.FocusGuardEnabled = *probe.FocusGuardEnabled
+			if json.Unmarshal(data, &probe) == nil {
+				if probe.FocusGuardEnabled != nil {
+					AppConfig.FocusGuardEnabled = *probe.FocusGuardEnabled
+				}
+				if probe.ChatGuardEnabled != nil {
+					AppConfig.ChatGuardEnabled = *probe.ChatGuardEnabled
+				}
 			}
 
 			// toggle_hotkey_vk가 0이면(구버전 config 또는 명시적 해제) 기본값 유지.
@@ -156,14 +172,61 @@ func LoadConfig() {
 	}
 }
 
-func SaveConfig() {
-	AppConfig.mu.RLock()
-	defer AppConfig.mu.RUnlock()
-
-	data, err := json.MarshalIndent(AppConfig, "", "  ")
-	if err == nil {
-		ioutil.WriteFile(configFilePath, data, 0644)
+// readConfigFile: 올바른 JSON인 설정 파일 내용을 돌려준다. 본 파일이 없거나 깨졌으면
+// 저장할 때마다 남겨 둔 직전 정상본(.bak)으로 대신한다. 둘 다 못 쓰면 nil.
+func readConfigFile() []byte {
+	for _, p := range []string{configFilePath, configFilePath + ".bak"} {
+		if data, err := os.ReadFile(p); err == nil && json.Valid(data) {
+			return data
+		}
 	}
+	return nil
+}
+
+func SaveConfig() {
+	// 락은 직렬화하는 동안만 잡는다(디스크 쓰기 동안 훅 스레드의 읽기를 막지 않도록).
+	AppConfig.mu.RLock()
+	data, err := json.MarshalIndent(AppConfig, "", "  ")
+	AppConfig.mu.RUnlock()
+	if err != nil {
+		return
+	}
+	writeFileAtomic(configFilePath, data)
+}
+
+// writeFileAtomic: 임시 파일에 다 쓰고 디스크에 flush한 뒤 이름을 바꿔 덮어쓴다.
+// 쓰는 도중에 꺼져도 본 파일은 이전 내용 그대로이거나 새 내용 전체 둘 중 하나다
+// (예전처럼 바로 덮어쓰면 중간에 끊긴 반쪽짜리 파일이 남아 설정이 통째로 날아갔다).
+// 교체 직전의 정상 파일은 .bak으로 한 부 남겨 둔다.
+func writeFileAtomic(path string, data []byte) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+
+	if old, err := os.ReadFile(path); err == nil && json.Valid(old) {
+		os.WriteFile(path+".bak", old, 0644) // 최선 노력: 실패해도 저장은 계속한다
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func (c *Config) SetActive(active bool) {
@@ -174,11 +237,12 @@ func (c *Config) SetActive(active bool) {
 	ActiveTriggersMu.Lock()
 	defer ActiveTriggersMu.Unlock()
 	if active {
-		ActiveTriggers = make(map[uint32]MacroSlot)
+		ActiveTriggers = make(map[trigKey]MacroSlot)
 		for _, s := range c.Slots {
 			if s.TriggerVK != 0 && s.TargetVK != 0 {
-				if existing, ok := ActiveTriggers[s.TriggerVK]; !ok || s.DelayMs < existing.DelayMs {
-					ActiveTriggers[s.TriggerVK] = s
+				k := trigKey{s.TriggerVK, s.TriggerMods}
+				if existing, ok := ActiveTriggers[k]; !ok || s.DelayMs < existing.DelayMs {
+					ActiveTriggers[k] = s
 				}
 			}
 		}
@@ -246,6 +310,19 @@ func (c *Config) GetFocusGuard() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.FocusGuardEnabled
+}
+
+// SetChatGuard: 채팅 중(Enter 감지)에는 매크로 트리거를 일시정지하는 옵션을 켜고 끈다.
+func (c *Config) SetChatGuard(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ChatGuardEnabled = enabled
+}
+
+func (c *Config) GetChatGuard() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ChatGuardEnabled
 }
 
 // SetToggleHotkey: 매크로 on/off 단축키를 바꾼다(항상 Ctrl과 함께 눌러야 함).
